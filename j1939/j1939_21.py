@@ -33,9 +33,10 @@ class J1939_21:
         Tb = 0.050
 
     class SendBufferState:
-        WAITING_CTS = 0        # waiting for CTS
-        SENDING_IN_CTS = 1     # sending packages (temporary state)
-        SENDING_BM = 2         # sending broadcast packages
+        WAITING_CTS             = 0 # waiting for CTS
+        SENDING_IN_CTS          = 1 # sending packages (temporary state)
+        SENDING_BM              = 2 # sending broadcast packages
+        TRANSMISSION_FINISHED   = 3 # finished, remove buffer
 
     def __init__(self, send_message, job_thread_wakeup, notify_subscribers, max_cmdt_packets, minimum_tp_rts_cts_dt_interval, minimum_tp_bam_dt_interval, ecu_is_message_acceptable):
         # Receive buffers
@@ -86,12 +87,12 @@ class J1939_21:
         """
         return ((src_address & 0xFF) << 8) | (dest_address & 0xFF)
 
-    def send_pgn(self, data_page, pdu_format, pdu_specific, priority, src_address, data, time_limit=0):
+    def send_pgn(self, data_page, pdu_format, pdu_specific, priority, src_address, data, time_limit, frame_format):
         pgn = ParameterGroupNumber(data_page, pdu_format, pdu_specific)
         if len(data) <= 8:
             # send normal message
             mid = MessageId(priority=priority, parameter_group_number=pgn.value, source_address=src_address)
-            self.__send_message(mid.can_id, data)
+            self.__send_message(mid.can_id, True, data)
         else:
             # if the PF is between 0 and 239, the message is destination dependent when pdu_specific != 255
             # if the PF is between 240 and 255, the message can only be broadcast
@@ -198,18 +199,25 @@ class J1939_21:
                                 while len(data)<7:
                                     data.append(255)
                             data.insert(0, package+1)
-                            self.__send_tp_dt(buf['src_address'], buf['dest_address'], data)
+
+                            # modify the snd_buffer state in anticipation
+                            # of the message we are about to transmit
 
                             buf['next_packet_to_send'] += 1
 
-                            # send end of message status
+                            should_break = False
                             if package == buf['next_wait_on_cts']:
                                 # wait on next cts
                                 buf['state'] = self.SendBufferState.WAITING_CTS
                                 buf['deadline'] = time.time() + self.Timeout.T3
-                                break
+                                should_break = True
                             elif self._minimum_tp_rts_cts_dt_interval != None:
                                 buf['deadline'] = time.time() + self._minimum_tp_rts_cts_dt_interval
+                                should_break = True
+
+                            # state is ready for recv - Now send the message
+                            self.__send_tp_dt(buf['src_address'], buf['dest_address'], data)
+                            if should_break:
                                 break
 
                         # recalc next wakeup
@@ -226,7 +234,10 @@ class J1939_21:
                             while len(data)<7:
                                 data.append(255)
                         data.insert(0, buf['next_packet_to_send']+1)
-                        self.__send_tp_dt(buf['src_address'], buf['dest_address'], data)
+
+                        # modify the snd_buffer state in anticipation
+                        # of the message we are about to transmit
+
                         buf['next_packet_to_send'] += 1
 
                         if buf['next_packet_to_send'] < buf['num_packages']:
@@ -237,6 +248,11 @@ class J1939_21:
                         else:
                             # done
                             del self._snd_buffer[bufid]
+
+                        # state is updated and ready for recv - now send data
+                        self.__send_tp_dt(buf['src_address'], buf['dest_address'], data)
+                    elif buf['state'] == self.SendBufferState.TRANSMISSION_FINISHED:
+                        del self._snd_buffer[bufid]
                     else:
                         logger.critical("unknown SendBufferState %d", buf['state'])
                         del self._snd_buffer[bufid]
@@ -326,7 +342,8 @@ class J1939_21:
                 self.__send_tp_abort(dest_address, src_address, self.ConnectionAbortReason.RESOURCES, pgn)
                 return
             # TODO: should we inform the application about the successful transmission?
-            del self._snd_buffer[buffer_hash]
+            self._snd_buffer[buffer_hash]['state'] = self.SendBufferState.TRANSMISSION_FINISHED
+            self._snd_buffer[buffer_hash]['deadline'] = time.time()
             self.__job_thread_wakeup()
         elif control_byte == self.ConnectionMode.BAM:
             message_size = data[1] | (data[2] << 8)
@@ -354,7 +371,8 @@ class J1939_21:
             # if abort received before transmission established -> cancel transmission
             buffer_hash = self._buffer_hash(dest_address, src_address)
             if buffer_hash in self._snd_buffer and self._snd_buffer[buffer_hash]['state'] == self.SendBufferState.WAITING_CTS:
-                del self._snd_buffer[buffer_hash] # cancel transmission
+                self._snd_buffer[buffer_hash]['state'] = self.SendBufferState.TRANSMISSION_FINISHED
+                self._snd_buffer[buffer_hash]['deadline'] = time.time()
             # TODO: any more abort responses?
             pass
         else:
@@ -408,42 +426,42 @@ class J1939_21:
     def __send_tp_dt(self, src_address, dest_address, data):
         pgn = ParameterGroupNumber(0, 235, dest_address)
         mid = MessageId(priority=7, parameter_group_number=pgn.value, source_address=src_address)
-        self.__send_message(mid.can_id, data)
+        self.__send_message(mid.can_id, True, data)
 
     def __send_tp_abort(self, src_address, dest_address, reason, pgn_value):
         pgn = ParameterGroupNumber(0, 236, dest_address)
         mid = MessageId(priority=7, parameter_group_number=pgn.value, source_address=src_address)
         data = [self.ConnectionMode.ABORT, reason, 0xFF, 0xFF, 0xFF, pgn_value & 0xFF, (pgn_value >> 8) & 0xFF, (pgn_value >> 16) & 0xFF]
-        self.__send_message(mid.can_id, data)
+        self.__send_message(mid.can_id, True, data)
 
     def __send_tp_cts(self, src_address, dest_address, num_packets, next_packet, pgn_value):
         pgn = ParameterGroupNumber(0, 236, dest_address)
         mid = MessageId(priority=7, parameter_group_number=pgn.value, source_address=src_address)
         data = [self.ConnectionMode.CTS, num_packets, next_packet, 0xFF, 0xFF, pgn_value & 0xFF, (pgn_value >> 8) & 0xFF, (pgn_value >> 16) & 0xFF]
-        self.__send_message(mid.can_id, data)
+        self.__send_message(mid.can_id, True, data)
 
     def __send_tp_eom_ack(self, src_address, dest_address, message_size, num_packets, pgn_value):
         pgn = ParameterGroupNumber(0, 236, dest_address)
         mid = MessageId(priority=7, parameter_group_number=pgn.value, source_address=src_address)
         data = [self.ConnectionMode.EOM_ACK, message_size & 0xFF, (message_size >> 8) & 0xFF, num_packets, 0xFF, pgn_value & 0xFF, (pgn_value >> 8) & 0xFF, (pgn_value >> 16) & 0xFF]
-        self.__send_message(mid.can_id, data)
+        self.__send_message(mid.can_id, True, data)
 
     def __send_tp_rts(self, src_address, dest_address, priority, pgn_value, message_size, num_packets, max_cmdt_packets):
         pgn = ParameterGroupNumber(0, 236, dest_address)
         mid = MessageId(priority=priority, parameter_group_number=pgn.value, source_address=src_address)
         data = [self.ConnectionMode.RTS, message_size & 0xFF, (message_size >> 8) & 0xFF, num_packets, max_cmdt_packets, pgn_value & 0xFF, (pgn_value >> 8) & 0xFF, (pgn_value >> 16) & 0xFF]
-        self.__send_message(mid.can_id, data)
+        self.__send_message(mid.can_id, True, data)
 
     def __send_acknowledgement(self, control_byte, group_function_value, address_acknowledged, pgn):
         data = [control_byte, group_function_value, 0xFF, 0xFF, address_acknowledged, (pgn & 0xFF), ((pgn >> 8) & 0xFF), ((pgn >> 16) & 0xFF)]
         mid = MessageId(priority=6, parameter_group_number=0x00E800, source_address=255)
-        self.__send_message(mid.can_id, data)
+        self.__send_message(mid.can_id, True, data)
 
     def __send_tp_bam(self, src_address, priority, pgn_value, message_size, num_packets):
         pgn = ParameterGroupNumber(0, 236, ParameterGroupNumber.Address.GLOBAL)
         mid = MessageId(priority=priority, parameter_group_number=pgn.value, source_address=src_address)
         data = [self.ConnectionMode.BAM, message_size & 0xFF, (message_size >> 8) & 0xFF, num_packets, 0xFF, pgn_value & 0xFF, (pgn_value >> 8) & 0xFF, (pgn_value >> 16) & 0xFF]
-        self.__send_message(mid.can_id, data)
+        self.__send_message(mid.can_id, True, data)
 
     def notify(self, can_id, data, timestamp):
         """Feed incoming CAN message into this ecu.
